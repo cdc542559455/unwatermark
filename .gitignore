@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+*.mp4
+*.avi
+*.mov
+*.mkv
+preview_frame_*.png
+.DS_Store
