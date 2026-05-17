@@ -185,10 +185,9 @@ def detect_watermark(video_path, num_samples=50):
 
 def build_mask(video_path, corner, bbox, padding=20, num_samples=50):
     """
-    Build a precise inpainting mask that covers:
-      - The watermark text (detected via temporal edge stability)
-      - The rounded-rect border
-      - The semi-transparent fill inside the border
+    Build a precise inpainting mask covering only the watermark text and
+    border outline. Kept thin so LaMa can naturally reconstruct texture
+    without hallucinating large color blocks.
 
     Returns a binary mask (uint8, 0 or 255) at full frame resolution.
     """
@@ -212,11 +211,11 @@ def build_mask(video_path, corner, bbox, padding=20, num_samples=50):
         count += 1
     cap.release()
 
-    # Static edges = watermark outline
+    # Static edges = watermark text + border outline
     threshold = count * 0.30
     edge_mask = (edge_accum >= threshold).astype(np.uint8) * 255
 
-    # Zero out everything except the watermark corner region (with padding)
+    # Isolate only the watermark region
     bx, by, bw, bh = bbox
     pad = padding
     roi_x1 = max(0, bx - pad)
@@ -227,26 +226,12 @@ def build_mask(video_path, corner, bbox, padding=20, num_samples=50):
     isolated = np.zeros_like(edge_mask)
     isolated[roi_y1:roi_y2, roi_x1:roi_x2] = edge_mask[roi_y1:roi_y2, roi_x1:roi_x2]
 
-    # Close gaps in edges and fill the interior of the watermark badge
+    # Minimal dilation — just enough to cover anti-aliased edges around
+    # the text and border. Do NOT fill the interior or create a solid block.
     kernel = np.ones((3, 3), np.uint8)
-    closed = cv2.dilate(isolated, kernel, iterations=2)
-    closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, kernel, iterations=4)
+    mask = cv2.dilate(isolated, kernel, iterations=2)
 
-    # Find contours and fill the largest one (the badge outline)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filled = np.zeros((vh, vw), dtype=np.uint8)
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area > 300:
-            cv2.drawContours(filled, [c], -1, 255, -1)
-
-    # Combine filled interior with original edge pixels
-    combined = cv2.bitwise_or(filled, isolated)
-
-    # Dilate slightly to catch anti-aliased edges and semi-transparent fringe
-    combined = cv2.dilate(combined, kernel, iterations=2)
-
-    return combined
+    return mask
 
 
 # ── Core: LaMa Inpainting ───────────────────────────────────────────────────
@@ -260,10 +245,15 @@ def _try_import_iopaint():
         return False
 
 
-def inpaint_frame_lama(model, frame_rgb, mask):
-    """Inpaint a single frame using LaMa via iopaint."""
-    from iopaint.schema import HDStrategy, InpaintRequest
+def inpaint_frame_lama(model, frame_bgr, mask):
+    """Inpaint a single frame using LaMa via iopaint.
 
+    LaMa.forward() expects RGB input and returns BGR output.
+    We handle the conversion here so callers work in BGR throughout.
+    """
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    # Call forward() directly — returns BGR uint8
+    from iopaint.schema import InpaintRequest, HDStrategy
     config = InpaintRequest(
         hd_strategy=HDStrategy.ORIGINAL,
         hd_strategy_crop_margin=64,
@@ -271,6 +261,10 @@ def inpaint_frame_lama(model, frame_rgb, mask):
         hd_strategy_resize_limit=1280,
     )
     result = model(frame_rgb, mask, config)
+    # model() wrapper may return float64; ensure uint8
+    if result.dtype != np.uint8:
+        result = np.clip(result, 0, 255).astype(np.uint8)
+    # Result is already BGR from LaMa's internal conversion
     return result
 
 
@@ -327,16 +321,21 @@ def process_video(input_path, output_path, mask, quality=18, device="cpu"):
             break
 
         if use_lama:
-            # LaMa expects RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Process only the ROI for speed
-            roi_frame = frame_rgb[ry1:ry2, rx1:rx2].copy()
+            # Process only the ROI for speed — all in BGR
+            roi_frame = frame[ry1:ry2, rx1:rx2].copy()
             roi_mask = mask[ry1:ry2, rx1:rx2].copy()
 
             if np.any(roi_mask > 0):
                 roi_result = inpaint_frame_lama(model, roi_frame, roi_mask)
-                frame_rgb[ry1:ry2, rx1:rx2] = roi_result
-            result = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                # ONLY replace masked pixels — LaMa shifts colors in the
+                # entire region it processes, so we must keep originals elsewhere
+                blend_mask = cv2.dilate(roi_mask, np.ones((3, 3), np.uint8), iterations=1)
+                blend_f = cv2.GaussianBlur(blend_mask.astype(np.float32), (7, 7), 2) / 255.0
+                blend_3 = np.stack([blend_f] * 3, axis=-1)
+                blended = (roi_frame.astype(np.float32) * (1 - blend_3)
+                           + roi_result.astype(np.float32) * blend_3)
+                frame[ry1:ry2, rx1:rx2] = np.clip(blended, 0, 255).astype(np.uint8)
+            result = frame
         else:
             result = inpaint_frame_opencv(frame, mask)
 
@@ -415,15 +414,19 @@ def save_preview(input_path, mask, device="cpu", output_dir=None):
         if not ret:
             continue
 
-        # Inpaint this frame
+        # Inpaint this frame — all in BGR
         if use_lama:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            roi_frame = frame_rgb[ry1:ry2, rx1:rx2].copy()
+            clean = frame.copy()
+            roi_frame = clean[ry1:ry2, rx1:rx2].copy()
             roi_mask = mask[ry1:ry2, rx1:rx2].copy()
             if np.any(roi_mask > 0):
                 roi_result = inpaint_frame_lama(model, roi_frame, roi_mask)
-                frame_rgb[ry1:ry2, rx1:rx2] = roi_result
-            clean = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                blend_mask = cv2.dilate(roi_mask, np.ones((3, 3), np.uint8), iterations=1)
+                blend_f = cv2.GaussianBlur(blend_mask.astype(np.float32), (7, 7), 2) / 255.0
+                blend_3 = np.stack([blend_f] * 3, axis=-1)
+                blended = (roi_frame.astype(np.float32) * (1 - blend_3)
+                           + roi_result.astype(np.float32) * blend_3)
+                clean[ry1:ry2, rx1:rx2] = np.clip(blended, 0, 255).astype(np.uint8)
         else:
             clean = inpaint_frame_opencv(frame, mask)
 
